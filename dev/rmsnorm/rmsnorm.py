@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 
 eps = 1e-6
 
@@ -28,12 +27,16 @@ class RMSNorm:
         dw = (dout * norm).sum((0, 1))
         # gradients for input
         dnorm = dout * w # B,T,C
+
+        # calculate step by step
         # dx = dnorm * rsqrt # B,T,C
         # drsqrt = (dnorm * x).sum(-1, keepdim=True) # B,T,1
         # dmean = drsqrt * -0.5 * (mean + eps) ** -1.5 # B,T,1
         # dx2_sum = dmean * C ** -1 # B,T,1
         # dx2 = dx2_sum * torch.ones_like(x) # B,T,C
-        # dx += dx2 * (2 * x) # B,T,C     
+        # dx += dx2 * (2 * x) # B,T,C    
+
+        # simplify the above calculation
         dx = dnorm * rsqrt - ((dnorm * x).mean(-1, keepdim=True) * rsqrt**3 * x)
         
         return dx, dw, db
@@ -55,8 +58,8 @@ dx, dw, db = RMSNorm.backward(dout, cache)
 fakeloss = (out * dout).sum()
 fakeloss.backward()
 
-print("exact: ", torch.all(x.grad == dx).item())
-print("approximate: ", torch.allclose(x.grad, dx))
+print("dx exact: ", torch.all(x.grad == dx).item())
+print("dx approximate: ", torch.allclose(x.grad, dx))
 print("dx error:", (x.grad - dx).abs().max().item())
 print("dw error:", (w.grad - dw).abs().max().item())
 print("db error:", (b.grad - db).abs().max().item())

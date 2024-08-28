@@ -1,3 +1,7 @@
+// must run `python rmsnorm.py` first to generate the reference data
+// then compile for example as `gcc rmsnorm.c -o rmsnorm -lm`
+// and then run as `./rmsnorm` to see the output
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
