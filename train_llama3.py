@@ -847,25 +847,61 @@ def write_bf16(tensor, file):
 
 def write_tensors(model_tensors, L, file, dtype):
     # writes LLaMA 3 model's weights to a binary file
+    # things get a bit more complicated though:
+    # 1) We want to maintain the ability to finetune just the biases in the C code
+    #    and also GPT-2 supported biases and we want to touch as little code as possible.
+    #    => We will generate biases of all zeros and write them here. It's very little data.
+    # 2) We want to exactly preserve the GPT-2 code paths, so we can't have SwiGLU using two
+    #    separate nn.Linear layers c_fc and c_fc2. We will merge them into a single c_fc layer.
+    #    Then later in the C code, we do pointer arithmetic to recover them fully internal to
+    #    the SwiGLU layer
+    # 3) Llama 3 does not use position embeddings table so we have to remove it. AT THE SAME TIME,
+    #    and, very conveniently, Llama 3 does not share the output projection weights with the
+    #    token embeddings table, so we have to add it. Well instead of removing and adding, we
+    #    are going to write the output projection weights into the slot previously used for the
+    #    position embeddings table. Everyone is happy, very little code is changed from GPT-2.
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["lm_head.weight"], file) # (V, C) # <--- hack (3) here!
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        # see hack (1) above for these
+        # yes i know this is inefficient and dumb i'm just matching the train_gpt2.py code format
+        write_fun(torch.zeros_like(model_tensors[f"transformer.h.{i}.ln_1.weight"]), file)
     for i in range(L): # (L, 3C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, 3C)
+        w = model_tensors[f"transformer.h.{i}.attn.c_attn.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
     for i in range(L): # (L, C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
+        w = model_tensors[f"transformer.h.{i}.attn.c_proj.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
+    for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(torch.zeros_like(model_tensors[f"transformer.h.{i}.ln_2.weight"]), file)
+    # now for hack (2) here... inline model surgery to concat c_fc and c_fc2
+    # -------------------------------------------
     for i in range(L): # (L, 4C, C)
+        # simply write the two weights in sequence
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
+    for i in range(L): # (L, 4C)
+        w1 = model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"]
+        w2 = model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"]
+        write_fun(torch.zeros(w1.size(0) + w2.size(0), dtype=w1.dtype), file)
+    # -------------------------------------------
     for i in range(L): # (L, C, 4C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        w = model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"]
+        write_fun(torch.zeros(w.size(0), dtype=w.dtype), file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
+    write_fun(torch.zeros_like(model_tensors["transformer.ln_f.weight"]), file) # (C, )
 
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
@@ -875,28 +911,31 @@ def write_model(model, filename, dtype):
         "float32": 3, # 3: all tensors are fp32
         "bfloat16": 5, # 5: all tensors are bf16
     }[dtype]
-    header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = version # checkpoint version
-    header[2] = model.config.block_size
-    header[3] = model.config.vocab_size
-    header[4] = model.config.n_layer
-    header[5] = model.config.n_head
-    header[6] = model.config.n_kv_head
-    header[7] = model.config.n_embd
-    header[8] = model.config.ffn_dim_multiplier
-    header[9] = model.config.multiple_of
-    header[10] = model.config.norm_eps
-    header[11] = model.config.rope_theta
-    header[12] = model.config.use_scaled_rope
-    header[13] = model.config.max_gen_batch_size
-    header[14] = int(model.config.version.split('.')[0]) # major version
-    header[15] = int(model.config.version.split('.')[1]) # minor version
+    # integer section of the header
+    header_int = torch.zeros(256, dtype=torch.int32)
+    header_int[0] = 20240803 # magic
+    header_int[1] = version # checkpoint version
+    header_int[2] = model.config.block_size
+    header_int[3] = model.config.vocab_size
+    header_int[4] = model.config.n_layer
+    header_int[5] = model.config.n_head
+    header_int[6] = model.config.n_kv_head
+    header_int[7] = model.config.n_embd
+    header_int[8] = model.config.multiple_of
+    header_int[9] = int(model.config.use_scaled_rope)
+    header_int[10] = int(model.config.version.split('.')[0]) # major version
+    header_int[11] = int(model.config.version.split('.')[1]) # minor version
+    # float section of the header
+    header_float = torch.zeros(256, dtype=torch.float32)
+    header_float[0] = model.config.ffn_dim_multiplier
+    header_float[1] = model.config.norm_eps
+    header_float[2] = model.config.rope_theta
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
     # now write to file
     with open(filename, "wb") as file:
-        file.write(header.numpy().tobytes()) # header
+        file.write(header_int.numpy().tobytes()) # int header
+        file.write(header_float.numpy().tobytes()) # float header
         write_tensors(params, model.config.n_layer, file, dtype) # params
     print(f"wrote {filename}")
 
@@ -943,7 +982,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinystories/TinyStories_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
@@ -955,7 +994,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate warmup iterations")
     parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
     parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
