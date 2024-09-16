@@ -37,8 +37,8 @@ class RMSNorm:
         # dx += dx2 * (2 * x) # B,T,C    
 
         # simplify the above calculation
-        dx = dnorm * rsqrt - ((dnorm * x).mean(-1, keepdim=True) * rsqrt**3 * x)
-        
+        dx = dnorm - ((dnorm * x).mean(-1, keepdim=True) * (mean+eps)**-1 * x)
+        dx *= rsqrt
         return dx, dw, db
 
 
