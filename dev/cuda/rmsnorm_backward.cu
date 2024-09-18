@@ -1,14 +1,14 @@
 /*
-Kernels for layernorm backward pass.
+Kernels for rmsnorm backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_backward.cu -o layernorm_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt rmsnorm_backward.cu -o rmsnorm_backward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
-./layernorm_backward 1
+./rmsnorm_backward 1
 
 version 2 moves a lot of reduction to shared memory over global memory
-./layernorm_backward 2
+./rmsnorm_backward 2
 */
 
 #include <stdio.h>
@@ -24,14 +24,9 @@ version 2 moves a lot of reduction to shared memory over global memory
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-void layernorm_forward_cpu(float* out, float* mean, float* rstd,
+void rmsnorm_forward_cpu(float* out, float* mean, float* rsqrt,
                        const float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
-    // both inp and out are (B,T,C) of the activations
-    // mean and rstd are (B,T) buffers, to be used later in backward pass
-    // at each position (b,t) of the input, the C-dimensional vector
-    // of activations gets normalized, then scaled and shifted
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -40,58 +35,48 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
             // calculate the mean
             float m = 0.0f;
             for (int i = 0; i < C; i++) {
-                m += x[i];
+                m += x[i] * x[i];
             }
             m = m/C;
-            // calculate the variance (without any bias correction)
-            float v = 0.0f;
-            for (int i = 0; i < C; i++) {
-                float xshift = x[i] - m;
-                v += xshift * xshift;
-            }
-            v = v/C;
-            // calculate the rstd (reciprocal standard deviation)
-            float s = 1.0f / sqrtf(v + eps);
+            // calculate the rsqrt
+            float s = 1.0f / sqrtf(m + eps);
             // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalize
-                float o = n * weight[i] + bias[i]; // scale and shift
+                float n = s * x[i]; // normalized output
+                float o = n * weight[i] + bias[i]; // scale and shift it
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
             mean[b * T + t] = m;
-            rstd[b * T + t] = s;
+            rsqrt[b * T + t] = s;
         }
     }
 }
 
-void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
-                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
+void rmsnorm_backward_cpu(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rsqrt,
                         int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            const float* dout_bt = dout + b * T * C + t * C;
-            const float* inp_bt = inp + b * T * C + t * C;
+            float* dout_bt = dout + b * T * C + t * C;
+            float* inp_bt = inp + b * T * C + t * C;
             float* dinp_bt = dinp + b * T * C + t * C;
-            const float mean_bt = mean[b * T + t];
-            const float rstd_bt = rstd[b * T + t];
+            float mean_bt = mean[b * T + t];
+            float rsqrt_bt = rsqrt[b * T + t];
 
-            // first: two reduce operations
-            float dnorm_mean = 0.0f;
-            float dnorm_norm_mean = 0.0f;
+            // first: reduce operations
+            float dnorm_x_mean = 0.0f;
             for (int i = 0; i < C; i++) {
-                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 float dnorm_i = weight[i] * dout_bt[i];
-                dnorm_mean += dnorm_i;
-                dnorm_norm_mean += dnorm_i * norm_bti;
+              
+                dnorm_x_mean += dnorm_i * inp_bt[i];
             }
-            dnorm_mean = dnorm_mean / C;
-            dnorm_norm_mean = dnorm_norm_mean / C;
+            dnorm_x_mean = dnorm_x_mean / C;
 
             // now iterate again and accumulate all the gradients
             for (int i = 0; i < C; i++) {
-                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                float norm_bti = inp_bt[i] * rsqrt_bt;
                 float dnorm_i = weight[i] * dout_bt[i];
                 // gradient contribution to bias
                 dbias[i] += dout_bt[i];
@@ -99,10 +84,8 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
                 dweight[i] += norm_bti * dout_bt[i];
                 // gradient contribution to input
                 float dval = 0.0f;
-                dval += dnorm_i; // term 1
-                dval -= dnorm_mean; // term 2
-                dval -= norm_bti * dnorm_norm_mean; // term 3
-                dval *= rstd_bt; // final scale
+                dval += dnorm_i * rsqrt_bt; // term 1
+                dval -= dnorm_x_mean * pow(rsqrt_bt, 3) * inp_bt[i]; // term 2
                 dinp_bt[i] += dval;
             }
         }
@@ -140,7 +123,7 @@ __device__ void atomicAddX(float* addr, float val) {
 }
 
 // super naive kernel that just parallelizes over B,T and loops over C
-__global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
+__global__ void rmsnorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -186,7 +169,7 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
 
 // uses shared memory instead for the reduces
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+__global__ void rmsnorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, float* dweight_tmp, float* dbias_tmp) {
     extern __shared__ float shared[]; // size = 2 * C
@@ -269,7 +252,7 @@ __global__ void copy_to_dweight_dbias(int C, Tparams* dbias, Tparams* dweight, f
 // kernel2 is 1 threadblock for all Cs on 32 BTs (assuming threadblock size of 1024 threads = 32 warps)
 // To minimise the amount of atomicAdds, we will aim for 1 threadblock per SM, processing (total BTs / threadblocks) BTs
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+__global__ void rmsnorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C
@@ -344,7 +327,7 @@ __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparam
 
 // atomicCAS version of kernel3
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+__global__ void rmsnorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C
@@ -456,7 +439,7 @@ __global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparam
 
 // FP32 scratchpad per threadgroup, zero atomics except atomicAdd on unsigned int for the flag (based on kernel3)
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+__global__ void rmsnorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
@@ -556,7 +539,7 @@ __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparam
 
 // single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+__global__ void rmsnorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
@@ -649,7 +632,7 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
 
 
 // Same as kernel 6 but without cooperative groups or templates
-__global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+__global__ void rmsnorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
@@ -741,7 +724,7 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
 }
 
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
-                layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                rmsnorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
@@ -864,7 +847,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     }
 }
 
-__global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+__global__ void rmsnorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
@@ -1048,15 +1031,52 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
     }
 }
 
+// void rmsnorm_backward(float* dinp, float* dweight, float* dbias,
+//                         float* dout, float* inp, float* weight, float* mean, float* rsqrt,
+//                         int B, int T, int C) {
+//     for (int b = 0; b < B; b++) {
+//         for (int t = 0; t < T; t++) {
+//             float* dout_bt = dout + b * T * C + t * C;
+//             float* inp_bt = inp + b * T * C + t * C;
+//             float* dinp_bt = dinp + b * T * C + t * C;
+//             float mean_bt = mean[b * T + t];
+//             float rsqrt_bt = rsqrt[b * T + t];
+
+//             // first: reduce operations
+//             float dnorm_x_mean = 0.0f;
+//             for (int i = 0; i < C; i++) {
+//                 float dnorm_i = weight[i] * dout_bt[i];
+              
+//                 dnorm_x_mean += dnorm_i * inp_bt[i];
+//             }
+//             dnorm_x_mean = dnorm_x_mean / C;
+
+//             // now iterate again and accumulate all the gradients
+//             for (int i = 0; i < C; i++) {
+//                 float norm_bti = inp_bt[i] * rsqrt_bt;
+//                 float dnorm_i = weight[i] * dout_bt[i];
+//                 // gradient contribution to bias
+//                 dbias[i] += dout_bt[i];
+//                 // gradient contribution to weight
+//                 dweight[i] += norm_bti * dout_bt[i];
+//                 // gradient contribution to input
+//                 float dval = 0.0f;
+//                 dval += dnorm_i * rsqrt_bt; // term 1
+//                 dval -= dnorm_x_mean * pow(rsqrt_bt, 3) * inp_bt[i]; // term 2
+//                 dinp_bt[i] += dval;
+//             }
+//         }
+//     }
+// }
 
 // similar to kernel 9, but uses vectors to access shared memory, which also avoids the bank conflict problems,
 // and makes use require fewer barriers, at the cost of increased shared memory consumption.
 // warning: this kernel is _extremely_ close to getting register spills, so many "optimizations" turn out to be unhelpful
 // or need to be implemented in a very specific way.
 __global__ void __launch_bounds__(512, 2)
-layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+rmsnorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                             const floatX* dout, const floatX* inp, const floatX* weight,
-                            const floatX* mean, const floatX* rstd,
+                            const floatX* mean, const floatX* rsqrt,
                             int B, int T, int C) {
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -1106,7 +1126,7 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
         }
 
         const float mean_bt = (float)mean[bt];
-        const float rstd_bt = (float)rstd[bt];
+        const float rsqrt_bt = (float)rsqrt[bt];
         dnorm_mean = warpReduceSum(dnorm_mean) / C;
         dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt * rstd_bt;
 
@@ -1253,16 +1273,16 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void layernorm_backward1(float* dinp, float* dweight, float* dbias,
+void rmsnorm_backward1(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C, const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(N, block_size);
-    layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    rmsnorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+void rmsnorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
     const int N = B * T;
@@ -1274,42 +1294,42 @@ void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
     cudaCheck(cudaMalloc(&dbias_tmp, C * sizeof(float)));
     cudaMemset(dweight_tmp, 0, C * sizeof(float));
     cudaMemset(dbias_tmp, 0, C * sizeof(float));
-    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp);
+    rmsnorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp);
     copy_to_dweight_dbias<<<1, 512>>>(C, dweight, dbias, dweight_tmp, dbias_tmp);
     cudaCheck(cudaFree(dweight_tmp));
     cudaCheck(cudaFree(dbias_tmp));
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+void rmsnorm_backward3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
     const int grid_size = (1024/block_size) * cuda_num_SMs;
     size_t shared_mem_size = 2 * C * sizeof(float);
-    layernorm_backward_kernel3<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    rmsnorm_backward_kernel3<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+void rmsnorm_backward4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
         const int grid_size = (1024/block_size) * cuda_num_SMs;
         size_t shared_mem_size = 2 * C * sizeof(float);
-        layernorm_backward_kernel4<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel4<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+void rmsnorm_backward5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
         const int grid_size = 1 * cuda_num_SMs; // only support 1 block per SM for simplicity, 1024 threads is best anyway
         size_t shared_mem_size = (2 * C + 1) * sizeof(float);
         cudaMemset(scratch, 0, (grid_size * 2 * C + 1) * sizeof(float));
-        layernorm_backward_kernel5<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel5<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+void rmsnorm_backward6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
         const int grid_size = (1024/block_size) * cuda_num_SMs;
@@ -1319,11 +1339,11 @@ void layernorm_backward6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
         // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
         cudaMemset(scratch, 0, (1 + 2 * C) * sizeof(float));
 
-        layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward7(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+void rmsnorm_backward7(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
         const int grid_size = (1024/block_size) * cuda_num_SMs;
@@ -1333,11 +1353,11 @@ void layernorm_backward7(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
         // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
         cudaMemset(scratch, 0, (1 + 2 * C) * sizeof(float));
 
-        layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel7<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+void rmsnorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
         const int grid_size = (1024/block_size) * cuda_num_SMs;
@@ -1347,11 +1367,11 @@ void layernorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
         // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
         cudaMemset(scratch, 0, (1 + 2 * C) * sizeof(float));
 
-        layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward9(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+void rmsnorm_backward9(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
 
@@ -1360,12 +1380,12 @@ void layernorm_backward9(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
         size_t shared_mem_size = (2 * C + 2 * block_size + 1) * sizeof(float);
 
         cudaMemset(scratch, 0, 1 * sizeof(float)); // just need to memset the flag for this version
-        layernorm_backward_kernel9<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel9<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
-                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+void rmsnorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rsqrt,
                          int B, int T, int C, int block_size) {
         if(block_size == 1024) {
             block_size = 512;
@@ -1376,12 +1396,12 @@ void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* 
         size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
         cudaCheck(cudaMemset(scratch, 0, 1 * sizeof(float))); // just need to memset the flag for this version
-        layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        rmsnorm_backward_kernel10<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rsqrt, B, T, C);
         cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
-void layernorm_backward(int kernel_num,
+void rmsnorm_backward(int kernel_num,
                         floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C,
@@ -1389,37 +1409,37 @@ void layernorm_backward(int kernel_num,
     switch (kernel_num) {
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         case 1:
-            layernorm_backward1(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward1(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
 #endif
         case 2:
-            layernorm_backward2(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward2(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 3:
-            layernorm_backward3(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward3(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
 #if defined(ENABLE_BF16)
         case 4:
-            layernorm_backward4(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward4(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
 #endif
         case 5:
-            layernorm_backward5(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward5(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 6:
-            layernorm_backward6(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward6(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 7:
-            layernorm_backward7(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward7(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 8:
-            layernorm_backward8(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward8(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 9:
-            layernorm_backward9(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward9(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
         case 10:
-            layernorm_backward10(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            rmsnorm_backward10(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
     default:
             printf("Invalid kernel number\n");
@@ -1444,14 +1464,14 @@ int main(int argc, char **argv) {
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(C);
     float* bias = make_random_float(C);
-    layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+    rmsnorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
 
     // now do the backward pass, again on CPU
     float *dout = make_random_float(B * T * C);
     float *dinp = make_zeros_float(B * T * C);
     float *dweight = make_zeros_float(C);
     float *dbias = make_zeros_float(C);
-    layernorm_backward_cpu(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    rmsnorm_backward_cpu(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 
     // the above calculations act as the reference
     // now let's do the same on the GPU
@@ -1499,7 +1519,7 @@ int main(int argc, char **argv) {
         cudaCheck(cudaMemset(d_dweight, 0, C * sizeof(floatX)));
         cudaCheck(cudaMemset(d_dbias, 0, C * sizeof(floatX)));
 
-        layernorm_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
+        rmsnorm_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
                            B, T, C, block_size);
 
         // check the correctness of the kernel
@@ -1520,7 +1540,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 100;
-        float elapsed_time = benchmark_kernel(repeat_times, layernorm_backward, kernel_num,
+        float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_backward, kernel_num,
                                               d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
                                               B, T, C, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);

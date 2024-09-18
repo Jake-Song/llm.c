@@ -32,7 +32,7 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 // CPU code reference
 
 // GPT-2 rmsnorm forward pass
-void rmsnorm_forward_cpu(float* out, float* mean, float* rstd,
+void rmsnorm_forward_cpu(float* out, float* mean, float* rsqrt,
                        const float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
     float eps = 1e-5f;
@@ -43,28 +43,21 @@ void rmsnorm_forward_cpu(float* out, float* mean, float* rstd,
             // calculate the mean
             float m = 0.0f;
             for (int i = 0; i < C; i++) {
-                m += x[i];
+                m += x[i] * x[i];
             }
             m = m/C;
-            // calculate the variance (without any bias correction)
-            float v = 0.0f;
-            for (int i = 0; i < C; i++) {
-                float xshift = x[i] - m;
-                v += xshift * xshift;
-            }
-            v = v/C;
-            // calculate the rstd
-            float s = 1.0f / sqrtf(v + eps);
+            // calculate the rsqrt
+            float s = 1.0f / sqrtf(m + eps);
             // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalized output
+                float n = s * x[i]; // normalized output
                 float o = n * weight[i] + bias[i]; // scale and shift it
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
             mean[b * T + t] = m;
-            rstd[b * T + t] = s;
+            rsqrt[b * T + t] = s;
         }
     }
 }
@@ -373,7 +366,6 @@ __global__ void rmsnorm_forward_kernel6(float* __restrict__ out, float* __restri
 
     sum = warpReduceSum(sum);
     float m = sum / C;
-    float v = 0.f;
     float s = rsqrtf(m + eps);
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
@@ -534,7 +526,7 @@ int main(int argc, char **argv) {
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* mean = (float*)malloc(B * T * sizeof(float));
-    float* rstd = (float*)malloc(B * T * sizeof(float));
+    float* rsqrt = (float*)malloc(B * T * sizeof(float));
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(C);
     float* bias = make_random_float(C);
@@ -542,13 +534,13 @@ int main(int argc, char **argv) {
     // move to GPU
     float* d_out;
     float* d_mean;
-    float* d_rstd;
+    float* d_rsqrt;
     float* d_inp;
     float* d_weight;
     float* d_bias;
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_mean, B * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_rstd, B * T * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_rsqrt, B * T * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_weight, C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_bias, C * sizeof(float)));
@@ -565,18 +557,18 @@ int main(int argc, char **argv) {
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
-    rmsnorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+    rmsnorm_forward_cpu(out, mean, rsqrt, inp, weight, bias, B, T, C);
 
     // check the correctness of the kernel at all block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
 
-        rmsnorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, block_size);
+        rmsnorm_forward(kernel_num, d_out, d_mean, d_rsqrt, d_inp, d_weight, d_bias, B, T, C, block_size);
 
         validate_result(d_out, out, "out", B * T * C, 1e-5f);
         validate_result(d_mean, mean, "mean", B * T, 1e-5f);
-        validate_result(d_rstd, rstd, "rstd", B * T, 1e-5f);
+        validate_result(d_rsqrt, rsqrt, "rstd", B * T, 1e-5f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -587,7 +579,7 @@ int main(int argc, char **argv) {
 
         int repeat_times = 2000;
         float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_forward,
-                                              kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias,
+                                              kernel_num, d_out, d_mean, d_rsqrt, d_inp, d_weight, d_bias,
                                               B, T, C, block_size);
 
         // napkin math: estimate the memory bandwidth achieved
@@ -601,13 +593,13 @@ int main(int argc, char **argv) {
     // free memory
     free(out);
     free(mean);
-    free(rstd);
+    free(rsqrt);
     free(inp);
     free(weight);
     free(bias);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_mean));
-    cudaCheck(cudaFree(d_rstd));
+    cudaCheck(cudaFree(d_rsqrt));
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_weight));
     cudaCheck(cudaFree(d_bias));
